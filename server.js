@@ -78,17 +78,28 @@ app.use('/api/withdraw', secureHandshake, require('./routes/withdraw'));
 // This allows the Bot to ask "Did phone X pay yet?"
 app.get('/api/check-status', async (req, res) => {
     const { phone } = req.query;
+    
+    if (!phone) {
+        return res.status(400).json({ error: "Phone number is required" });
+    }
+
+    console.log(`┃ 🔍 STATUS_QUERY: Checking status for ${phone}`);
+
     try {
         const user = await User.findOne({ mpesa_id: phone });
-        if (!user || user.history.length === 0) {
+        
+        if (!user || !user.history || user.history.length === 0) {
+            console.log(`┃ ⚠️  STATUS_RESULT: No history found for ${phone}`);
             return res.status(404).json({ status: "NOT_FOUND" });
         }
 
         // Get the most recent transaction
         const lastTx = user.history[user.history.length - 1];
         
-        // Only return if it happened in the last 2 minutes (to avoid old receipts)
-        const isRecent = (new Date() - new Date(lastTx.date)) < 120000;
+        // Return if it happened in the last 3 minutes (180,000ms)
+        const isRecent = (new Date() - new Date(lastTx.date)) < 180000;
+
+        console.log(`┃ ✅ STATUS_RESULT: Found Tx [${lastTx.receipt}] - Recent: ${isRecent}`);
 
         res.json({ 
             status: "OK", 
@@ -97,6 +108,7 @@ app.get('/api/check-status', async (req, res) => {
             lastTransaction: lastTx 
         });
     } catch (e) {
+        console.error("┃ ❌ STATUS_QUERY_CRASH:", e.message);
         res.status(500).json({ error: e.message });
     }
 });
