@@ -21,7 +21,6 @@ const sendToBot = async (jid, text) => {
         });
         console.log(`┃ ✅ NOTIFY_SENT: Message pushed to Bot for JID: ${jid}`);
     } catch (e) {
-        // Detailed logging to see why it fails if it does
         console.error("┃ ❌ BOT_NOTIFY_FAILED:", e.response?.status || e.message);
     }
 };
@@ -75,6 +74,33 @@ const secureHandshake = (req, res, next) => {
 app.use('/api/deposit', secureHandshake, require('./routes/deposit'));
 app.use('/api/withdraw', secureHandshake, require('./routes/withdraw'));
 
+// --- NEW: POLLING ROUTE FOR WORKER BOTS ---
+// This allows the Bot to ask "Did phone X pay yet?"
+app.get('/api/check-status', async (req, res) => {
+    const { phone } = req.query;
+    try {
+        const user = await User.findOne({ mpesa_id: phone });
+        if (!user || user.history.length === 0) {
+            return res.status(404).json({ status: "NOT_FOUND" });
+        }
+
+        // Get the most recent transaction
+        const lastTx = user.history[user.history.length - 1];
+        
+        // Only return if it happened in the last 2 minutes (to avoid old receipts)
+        const isRecent = (new Date() - new Date(lastTx.date)) < 120000;
+
+        res.json({ 
+            status: "OK", 
+            isRecent,
+            balance: user.balance, 
+            lastTransaction: lastTx 
+        });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
 // --- 5. THE ULTIMATE CALLBACK (M-PESA LISTENER) ---
 app.post('/api/callback', async (req, res) => {
     try {
@@ -82,7 +108,7 @@ app.post('/api/callback', async (req, res) => {
         let mpesaData = null;
         let logMessage = "";
         let finalStatusMessage = "";
-        let targetJid = req.query.jid; // We pass JID in the Callback URL from deposit route
+        let targetJid = req.query.jid; 
 
         if (body && body.stkCallback) {
             const callback = body.stkCallback;
@@ -114,7 +140,6 @@ app.post('/api/callback', async (req, res) => {
             }
         } 
 
-        // Update Database & Send WhatsApp Notification
         if (mpesaData) {
             const updateAmount = mpesaData.type === "DEPOSIT" ? mpesaData.amount : -mpesaData.amount;
             const internalRef = `VHB-${Math.floor(100000 + Math.random() * 900000)}`;
@@ -130,7 +155,6 @@ app.post('/api/callback', async (req, res) => {
             console.log(`┃ ${logMessage} | New Bal: ${user.balance}`);
         }
 
-        // Push the final styled message to the Bot
         if (targetJid && finalStatusMessage) {
             await sendToBot(targetJid, finalStatusMessage);
         }
