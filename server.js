@@ -7,7 +7,6 @@ const app = express();
 app.use(express.json());
 
 // --- 1. DEEP LOGGING MIDDLEWARE ---
-// This ensures you see exactly what the bot and M-PESA are doing in real-time.
 app.use((req, res, next) => {
     const start = Date.now();
     console.log(`\n┏━━━━━ ✿ INCOMING_REQUEST ✿ ━━━━━┓`);
@@ -25,13 +24,12 @@ app.use((req, res, next) => {
 });
 
 // --- 2. SHARED DATABASE SCHEMA ---
-// This is the "Brain" shared between your Bot and this Proxy.
 const UserSchema = new mongoose.Schema({
-    mpesa_id: { type: String, required: true, unique: true }, // The 254... number
+    mpesa_id: { type: String, required: true, unique: true },
     name: { type: String, default: "V_Hub Member" },
     balance: { type: Number, default: 0 },
     history: [{
-        type: { type: String }, // DEPOSIT or WITHDRAW
+        type: { type: String },
         amount: Number,
         receipt: String,
         v_hub_ref: String,
@@ -40,7 +38,6 @@ const UserSchema = new mongoose.Schema({
 });
 const User = mongoose.model('User', UserSchema);
 
-// Connect to MongoDB Atlas
 mongoose.connect(process.env.MONGO_URI)
     .then(() => console.log("┃ ✿ DATABASE: ATTACHED & READY"))
     .catch(err => console.error("┃ ❌ DB_ERROR:", err));
@@ -57,19 +54,20 @@ const secureHandshake = (req, res, next) => {
 // --- 4. ROUTES ---
 app.use('/api/deposit', secureHandshake, require('./routes/deposit'));
 app.use('/api/withdraw', secureHandshake, require('./routes/withdraw'));
-// Optional: app.use('/api/transfer', secureHandshake, require('./routes/transfer'));
 
 // --- 5. THE ULTIMATE CALLBACK (M-PESA LISTENER) ---
-// This captures real money and updates the Shared DB.
 app.post('/api/callback', async (req, res) => {
     try {
         const body = req.body.Body;
         let mpesaData = null;
+        let logMessage = "";
 
-        // A. Handling STK Push (Deposits)
         if (body && body.stkCallback) {
             const callback = body.stkCallback;
-            if (callback.ResultCode === 0) {
+            const resultCode = callback.ResultCode;
+
+            if (resultCode === 0) {
+                // --- SUCCESSFUL DEPOSIT ---
                 const meta = callback.CallbackMetadata.Item;
                 mpesaData = {
                     phone: meta.find(i => i.Name === "PhoneNumber").Value.toString(),
@@ -77,22 +75,47 @@ app.post('/api/callback', async (req, res) => {
                     receipt: meta.find(i => i.Name === "MpesaReceiptNumber").Value,
                     type: "DEPOSIT"
                 };
+                logMessage = `✅ SUCCESS: Recieved KSH ${mpesaData.amount} from ${mpesaData.phone}`;
+            } else {
+                // --- DETAILED ERROR HANDLING ---
+                let errorTitle = "❌ V_HUB: TRANSACTION FAILED";
+                let errorDetail = "";
+
+                switch (resultCode) {
+                    case 1:
+                        errorDetail = "Insufficient funds in your M-PESA account.";
+                        break;
+                    case 1032:
+                        errorDetail = "Transaction cancelled by user.";
+                        break;
+                    case 2001:
+                        errorDetail = "The M-PESA PIN entered was incorrect.";
+                        break;
+                    case 1037:
+                        errorDetail = "Request timed out. You took too long to enter your PIN.";
+                        break;
+                    default:
+                        errorDetail = callback.ResultDesc || "An unknown M-PESA error occurred.";
+                }
+                console.log(`┃ ⚠️  MPESA_DENIED: ${resultCode} - ${errorDetail}`);
+                // Note: You can trigger a webhook here to notify the bot of the failure
             }
         } 
-        // B. Handling B2C (Withdrawals)
         else if (req.body.Result) {
+            // --- B2C WITHDRAWAL HANDLING ---
             const result = req.body.Result;
             if (result.ResultCode === 0) {
-                // For B2C, we map based on the PartyB or original conversation context
                 mpesaData = {
-                    phone: result.ResultParameters.ResultParameter.find(i => i.Key === "ReceiverPartyPublicName").Value, // Or use a ref tracker
+                    phone: result.ResultParameters.ResultParameter.find(i => i.Key === "ReceiverPartyPublicName").Value,
                     amount: result.ResultParameters.ResultParameter.find(i => i.Key === "TransactionAmount").Value,
                     receipt: result.MpesaReceiptNumber,
                     type: "WITHDRAW"
                 };
+                logMessage = `✅ WITHDRAW_SUCCESS: Disbursed KSH ${mpesaData.amount} to ${mpesaData.phone}`;
             }
         }
 
+        // --- DATABASE UPDATE LOGIC ---
         if (mpesaData) {
             const updateAmount = mpesaData.type === "DEPOSIT" ? mpesaData.amount : -mpesaData.amount;
             const internalRef = `VHB-${Math.floor(100000 + Math.random() * 900000)}`;
@@ -113,7 +136,8 @@ app.post('/api/callback', async (req, res) => {
                 { upsert: true, new: true }
             );
 
-            console.log(`┃ ✅ SYNC_COMPLETE: ${user.mpesa_id} | New Bal: ${user.balance}`);
+            console.log(`┃ ${logMessage}`);
+            console.log(`┃ ✿ NEW_BALANCE: KSH ${user.balance}`);
         }
 
         res.json({ ResultCode: 0, ResultDesc: "Accepted" });
