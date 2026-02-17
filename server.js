@@ -6,18 +6,23 @@ require('dotenv').config();
 const app = express();
 app.use(express.json());
 
-// --- 0. BOT WEBHOOK CONFIG ---
-// Replace with your actual Bot's Heroku/Server URL
-const BOT_WEBHOOK = process.env.BOT_URL || "https://your-bot-url.herokuapp.com/v_hub_notify";
+// --- 0. BOT WEBHOOK CONFIG (HARDCODED AS REQUESTED) ---
+const BOT_URL = "https://gggg-b9d7fbe20737.herokuapp.com"; 
+const BOT_WEBHOOK = `${BOT_URL}/v_hub_notify`;
 
 // Helper to send styled responses back to WhatsApp
 const sendToBot = async (jid, text) => {
     try {
         await axios.post(BOT_WEBHOOK, { jid, text }, {
-            headers: { 'x-vhub-secret': process.env.API_SECRET }
+            headers: { 
+                'x-vhub-secret': process.env.API_SECRET,
+                'Content-Type': 'application/json'
+            }
         });
+        console.log(`┃ ✅ NOTIFY_SENT: Message pushed to Bot for JID: ${jid}`);
     } catch (e) {
-        console.error("┃ ❌ BOT_NOTIFY_FAILED:", e.message);
+        // Detailed logging to see why it fails if it does
+        console.error("┃ ❌ BOT_NOTIFY_FAILED:", e.response?.status || e.message);
     }
 };
 
