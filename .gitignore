@@ -1,0 +1,25 @@
+# --- V_HUB_PROXY SECRETS ---
+# NEVER push this file. It contains your Live Consumer Keys and Passkeys.
+.env
+
+# --- DEPENDENCIES ---
+# No need to push these; they are re-installed via 'npm install' on the server.
+node_modules/
+package-lock.json
+
+# --- LOCAL DATABASE & STORAGE ---
+# If you ever use local JSON DBs for testing, keep them private.
+database/*.json
+*.log
+
+# --- OS & IDE FILES ---
+.DS_Store
+.vscode/
+.idea/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# --- BUILD FILES ---
+dist/
+build/
