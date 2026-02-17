@@ -6,6 +6,21 @@ require('dotenv').config();
 const app = express();
 app.use(express.json());
 
+// --- 0. BOT WEBHOOK CONFIG ---
+// Replace with your actual Bot's Heroku/Server URL
+const BOT_WEBHOOK = process.env.BOT_URL || "https://your-bot-url.herokuapp.com/v_hub_notify";
+
+// Helper to send styled responses back to WhatsApp
+const sendToBot = async (jid, text) => {
+    try {
+        await axios.post(BOT_WEBHOOK, { jid, text }, {
+            headers: { 'x-vhub-secret': process.env.API_SECRET }
+        });
+    } catch (e) {
+        console.error("┃ ❌ BOT_NOTIFY_FAILED:", e.message);
+    }
+};
+
 // --- 1. DEEP LOGGING MIDDLEWARE ---
 app.use((req, res, next) => {
     const start = Date.now();
@@ -61,13 +76,14 @@ app.post('/api/callback', async (req, res) => {
         const body = req.body.Body;
         let mpesaData = null;
         let logMessage = "";
+        let finalStatusMessage = "";
+        let targetJid = req.query.jid; // We pass JID in the Callback URL from deposit route
 
         if (body && body.stkCallback) {
             const callback = body.stkCallback;
             const resultCode = callback.ResultCode;
 
             if (resultCode === 0) {
-                // --- SUCCESSFUL DEPOSIT ---
                 const meta = callback.CallbackMetadata.Item;
                 mpesaData = {
                     phone: meta.find(i => i.Name === "PhoneNumber").Value.toString(),
@@ -76,46 +92,24 @@ app.post('/api/callback', async (req, res) => {
                     type: "DEPOSIT"
                 };
                 logMessage = `✅ SUCCESS: Recieved KSH ${mpesaData.amount} from ${mpesaData.phone}`;
+                
+                finalStatusMessage = `┏━━━━━ ✿ *V_HUB_RECEIPT* ✿ ━━━━━┓\n┃\n┃ ✅ *DEPOSIT CONFIRMED*\n┃ 💵 *AMOUNT:* KSH ${mpesaData.amount}\n┃ 🧾 *REF:* ${mpesaData.receipt}\n┃ 🏦 *BANK:* M-PESA\n┃\n┃ _Your V_Hub balance has been updated._\n┗━━━━━━━━━━━━━━━━━━━━━━┛`;
             } else {
-                // --- DETAILED ERROR HANDLING ---
-                let errorTitle = "❌ V_HUB: TRANSACTION FAILED";
                 let errorDetail = "";
-
                 switch (resultCode) {
-                    case 1:
-                        errorDetail = "Insufficient funds in your M-PESA account.";
-                        break;
-                    case 1032:
-                        errorDetail = "Transaction cancelled by user.";
-                        break;
-                    case 2001:
-                        errorDetail = "The M-PESA PIN entered was incorrect.";
-                        break;
-                    case 1037:
-                        errorDetail = "Request timed out. You took too long to enter your PIN.";
-                        break;
-                    default:
-                        errorDetail = callback.ResultDesc || "An unknown M-PESA error occurred.";
+                    case 1: errorDetail = "Insufficient funds in your M-PESA account."; break;
+                    case 1032: errorDetail = "Transaction cancelled by user."; break;
+                    case 2001: errorDetail = "The M-PESA PIN entered was incorrect."; break;
+                    case 1037: errorDetail = "Request timed out. You took too long."; break;
+                    default: errorDetail = callback.ResultDesc || "M-PESA error.";
                 }
-                console.log(`┃ ⚠️  MPESA_DENIED: ${resultCode} - ${errorDetail}`);
-                // Note: You can trigger a webhook here to notify the bot of the failure
+                
+                finalStatusMessage = `┏━━━━━ ✿ *V_HUB_ALERT* ✿ ━━━━━┓\n┃\n┃ ❌ *PAYMENT FAILED*\n┃ ⚠️ *REASON:* ${errorDetail}\n┃\n┃ _Please try again with the correct PIN._\n┗━━━━━━━━━━━━━━━━━━━━━━┛`;
+                console.log(`┃ ⚠️  MPESA_DENIED: ${resultCode}`);
             }
         } 
-        else if (req.body.Result) {
-            // --- B2C WITHDRAWAL HANDLING ---
-            const result = req.body.Result;
-            if (result.ResultCode === 0) {
-                mpesaData = {
-                    phone: result.ResultParameters.ResultParameter.find(i => i.Key === "ReceiverPartyPublicName").Value,
-                    amount: result.ResultParameters.ResultParameter.find(i => i.Key === "TransactionAmount").Value,
-                    receipt: result.MpesaReceiptNumber,
-                    type: "WITHDRAW"
-                };
-                logMessage = `✅ WITHDRAW_SUCCESS: Disbursed KSH ${mpesaData.amount} to ${mpesaData.phone}`;
-            }
-        }
 
-        // --- DATABASE UPDATE LOGIC ---
+        // Update Database & Send WhatsApp Notification
         if (mpesaData) {
             const updateAmount = mpesaData.type === "DEPOSIT" ? mpesaData.amount : -mpesaData.amount;
             const internalRef = `VHB-${Math.floor(100000 + Math.random() * 900000)}`;
@@ -124,20 +118,16 @@ app.post('/api/callback', async (req, res) => {
                 { mpesa_id: mpesaData.phone },
                 { 
                     $inc: { balance: updateAmount },
-                    $push: { 
-                        history: { 
-                            type: mpesaData.type, 
-                            amount: mpesaData.amount, 
-                            receipt: mpesaData.receipt, 
-                            v_hub_ref: internalRef 
-                        } 
-                    }
+                    $push: { history: { type: mpesaData.type, amount: mpesaData.amount, receipt: mpesaData.receipt, v_hub_ref: internalRef } }
                 },
                 { upsert: true, new: true }
             );
+            console.log(`┃ ${logMessage} | New Bal: ${user.balance}`);
+        }
 
-            console.log(`┃ ${logMessage}`);
-            console.log(`┃ ✿ NEW_BALANCE: KSH ${user.balance}`);
+        // Push the final styled message to the Bot
+        if (targetJid && finalStatusMessage) {
+            await sendToBot(targetJid, finalStatusMessage);
         }
 
         res.json({ ResultCode: 0, ResultDesc: "Accepted" });
