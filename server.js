@@ -42,13 +42,14 @@ app.use((req, res, next) => {
     next();
 });
 
-// --- 2. SHARED DATABASE SCHEMA ---
+// --- 2. SHARED DATABASE SCHEMA (UPDATED WITH V_HUB_ID) ---
 const UserSchema = new mongoose.Schema({
     mpesa_id: { type: String, required: true, unique: true },
+    v_hub_id: { type: String, unique: true }, // New Account Number Field
     name: { type: String, default: "V_Hub Member" },
     balance: { type: Number, default: 0 },
     history: [{
-        type: { type: String },
+        type: { type: String }, // DEPOSIT, WITHDRAW, SENT, RECEIVED
         amount: Number,
         receipt: String,
         v_hub_ref: String,
@@ -74,8 +75,56 @@ const secureHandshake = (req, res, next) => {
 app.use('/api/deposit', secureHandshake, require('./routes/deposit'));
 app.use('/api/withdraw', secureHandshake, require('./routes/withdraw'));
 
+// --- NEW: INTERNAL PAY ROUTE (P2P WITH TARIFFS) ---
+app.post('/api/pay', secureHandshake, async (req, res) => {
+    const { sender_phone, receiver_id, amount } = req.body;
+    const transferAmount = Number(amount);
+
+    try {
+        const sender = await User.findOne({ mpesa_id: sender_phone });
+        // Find receiver by either Phone or VHB-ID
+        const receiver = await User.findOne({ 
+            $or: [{ mpesa_id: receiver_id }, { v_hub_id: receiver_id }] 
+        });
+
+        if (!sender || sender.balance < transferAmount) {
+            return res.status(400).json({ error: "INSUFFICIENT_BALANCE" });
+        }
+        if (!receiver) {
+            return res.status(404).json({ error: "RECEIVER_NOT_FOUND" });
+        }
+
+        // --- 2026 TARIFF LOGIC ---
+        let fee = 0;
+        if (transferAmount > 100 && transferAmount <= 500) fee = 7;
+        else if (transferAmount > 500 && transferAmount <= 1000) fee = 13;
+        else if (transferAmount > 1000) fee = 23;
+
+        const totalDeduction = transferAmount + fee;
+
+        if (sender.balance < totalDeduction) {
+            return res.status(400).json({ error: "INSUFFICIENT_FOR_FEE", fee });
+        }
+
+        const v_ref = `VHP-${Math.floor(100000 + Math.random() * 900000)}`;
+
+        // Process Transaction
+        sender.balance -= totalDeduction;
+        receiver.balance += transferAmount;
+
+        sender.history.push({ type: "SENT", amount: transferAmount, v_hub_ref: v_ref, receipt: `To: ${receiver.v_hub_id || receiver.mpesa_id}` });
+        receiver.history.push({ type: "RECEIVED", amount: transferAmount, v_hub_ref: v_ref, receipt: `From: ${sender.v_hub_id || sender.mpesa_id}` });
+
+        await sender.save();
+        await receiver.save();
+
+        res.json({ success: true, fee, newBalance: sender.balance, v_ref, receiverName: receiver.name });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
 // --- NEW: POLLING ROUTE FOR WORKER BOTS ---
-// This allows the Bot to ask "Did phone X pay yet?"
 app.get('/api/check-status', async (req, res) => {
     const { phone } = req.query;
     
@@ -93,10 +142,7 @@ app.get('/api/check-status', async (req, res) => {
             return res.status(404).json({ status: "NOT_FOUND" });
         }
 
-        // Get the most recent transaction
         const lastTx = user.history[user.history.length - 1];
-        
-        // Return if it happened in the last 3 minutes (180,000ms)
         const isRecent = (new Date() - new Date(lastTx.date)) < 180000;
 
         console.log(`┃ ✅ STATUS_RESULT: Found Tx [${lastTx.receipt}] - Recent: ${isRecent}`);
@@ -105,7 +151,8 @@ app.get('/api/check-status', async (req, res) => {
             status: "OK", 
             isRecent,
             balance: user.balance, 
-            lastTransaction: lastTx 
+            lastTransaction: lastTx,
+            v_hub_id: user.v_hub_id 
         });
     } catch (e) {
         console.error("┃ ❌ STATUS_QUERY_CRASH:", e.message);
@@ -156,9 +203,13 @@ app.post('/api/callback', async (req, res) => {
             const updateAmount = mpesaData.type === "DEPOSIT" ? mpesaData.amount : -mpesaData.amount;
             const internalRef = `VHB-${Math.floor(100000 + Math.random() * 900000)}`;
 
+            // --- AUTO ACCOUNT NUMBER GENERATION ---
+            const vHubID = `VHB-${Math.floor(100000 + Math.random() * 900000)}`;
+
             const user = await User.findOneAndUpdate(
                 { mpesa_id: mpesaData.phone },
                 { 
+                    $setOnInsert: { v_hub_id: vHubID }, // Only assign ID if new user
                     $inc: { balance: updateAmount },
                     $push: { history: { type: mpesaData.type, amount: mpesaData.amount, receipt: mpesaData.receipt, v_hub_ref: internalRef } }
                 },
