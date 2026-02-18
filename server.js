@@ -79,14 +79,21 @@ app.post('/api/withdraw', secureHandshake, async (req, res) => {
     const { phone, amount, waName } = req.body;
     const withdrawAmount = Number(amount);
 
-    // Truncate name to 12 characters
+    // Truncate name to 12 characters for v_hub consistency
     const shortName = waName ? (waName.length > 12 ? waName.substring(0, 12) + ".." : waName) : "Unknown";
 
     try {
-        // --- SECURITY: PREVENT MISUSE (CHECK IF USER EXISTS) ---
-        const user = await User.findOne({ mpesa_id: phone });
+        // --- SECURITY: PREVENT MISUSE (SMART SEARCH) ---
+        const user = await User.findOne({ 
+            $or: [
+                { mpesa_id: phone }, 
+                { v_hub_id: new RegExp(`^${phone}$`, 'i') }, 
+                { name: new RegExp(`^${phone}$`, 'i') }
+            ] 
+        });
+
         if (!user) {
-            console.log(`┃ ⚠️  SECURITY: Access Denied for unregistered user ${phone}`);
+            console.log(`┃ ⚠️  SECURITY: Access Denied for unknown user [${phone}]`);
             return res.status(403).json({ error: "USER_NOT_IN_DATABASE" });
         }
 
@@ -95,9 +102,9 @@ app.post('/api/withdraw', secureHandshake, async (req, res) => {
             return res.status(400).json({ error: "MINIMUM_WITHDRAW_10" });
         }
 
-        // Trigger Safaricom B2C Logic (Requires disburse function in routes/withdraw)
+        // Trigger Safaricom B2C Logic
         const b2c = require('./routes/withdraw');
-        const result = await b2c.disburse(phone, withdrawAmount);
+        const result = await b2c.disburse(user.mpesa_id, withdrawAmount);
 
         if (result.success) {
             user.balance -= withdrawAmount;
@@ -115,7 +122,7 @@ app.post('/api/withdraw', secureHandshake, async (req, res) => {
                 success: true, 
                 receipt: result.ConversationID, 
                 newBalance: user.balance,
-                shortName: shortName 
+                shortName: user.name 
             });
         } else {
             res.status(400).json({ error: result.message || "B2C_FAILED" });
@@ -126,7 +133,7 @@ app.post('/api/withdraw', secureHandshake, async (req, res) => {
     }
 });
 
-// --- NEW: INTERNAL PAY ROUTE (P2P WITH TARIFFS) ---
+// --- INTERNAL PAY ROUTE (P2P WITH TARIFFS) ---
 app.post('/api/pay', secureHandshake, async (req, res) => {
     const { sender_phone, receiver_id, amount } = req.body;
     const transferAmount = Number(amount);
@@ -134,7 +141,7 @@ app.post('/api/pay', secureHandshake, async (req, res) => {
     try {
         const sender = await User.findOne({ mpesa_id: sender_phone });
         const receiver = await User.findOne({ 
-            $or: [{ mpesa_id: receiver_id }, { v_hub_id: receiver_id }] 
+            $or: [{ mpesa_id: receiver_id }, { v_hub_id: new RegExp(`^${receiver_id}$`, 'i') }] 
         });
 
         if (!sender || sender.balance < transferAmount) {
@@ -172,18 +179,27 @@ app.post('/api/pay', secureHandshake, async (req, res) => {
     }
 });
 
-// --- NEW: POLLING ROUTE FOR WORKER BOTS ---
+// --- UPDATED: SMART SEARCH POLLING ROUTE ---
 app.get('/api/check-status', async (req, res) => {
-    const { phone } = req.query;
-    if (!phone) return res.status(400).json({ error: "Phone number is required" });
+    const { phone } = req.query; // Query can be Phone, Name, or ID
+    if (!phone) return res.status(400).json({ error: "Parameter required" });
+
+    console.log(`┃ 🔍 SMART_SEARCH: Querying [${phone}]`);
 
     try {
-        const user = await User.findOne({ mpesa_id: phone });
-        if (!user || !user.history || user.history.length === 0) {
+        const user = await User.findOne({ 
+            $or: [
+                { mpesa_id: phone }, 
+                { v_hub_id: new RegExp(`^${phone}$`, 'i') }, 
+                { name: new RegExp(`^${phone}$`, 'i') }
+            ] 
+        });
+
+        if (!user) {
             return res.status(404).json({ status: "NOT_FOUND" });
         }
 
-        const lastTx = user.history[user.history.length - 1];
+        const lastTx = user.history.length > 0 ? user.history[user.history.length - 1] : { date: new Date(0) };
         const isRecent = (new Date() - new Date(lastTx.date)) < 180000;
 
         res.json({ 
@@ -191,7 +207,9 @@ app.get('/api/check-status', async (req, res) => {
             isRecent,
             balance: user.balance, 
             lastTransaction: lastTx,
-            v_hub_id: user.v_hub_id 
+            v_hub_id: user.v_hub_id,
+            mpesa_id: user.mpesa_id,
+            name: user.name
         });
     } catch (e) {
         res.status(500).json({ error: e.message });
@@ -203,9 +221,8 @@ app.post('/api/callback', async (req, res) => {
     try {
         const body = req.body.Body;
         let mpesaData = null;
-        let logMessage = "";
-        let finalStatusMessage = "";
         let targetJid = req.query.jid; 
+        let waName = req.query.name || "V_Hub Member";
 
         if (body && body.stkCallback) {
             const callback = body.stkCallback;
@@ -219,40 +236,29 @@ app.post('/api/callback', async (req, res) => {
                     receipt: meta.find(i => i.Name === "MpesaReceiptNumber").Value,
                     type: "DEPOSIT"
                 };
-                logMessage = `✅ SUCCESS: Recieved KSH ${mpesaData.amount} from ${mpesaData.phone}`;
-                finalStatusMessage = `┏━━━━━ ✿ *V_HUB_RECEIPT* ✿ ━━━━━┓\n┃\n┃ ✅ *DEPOSIT CONFIRMED*\n┃ 💵 *AMOUNT:* KSH ${mpesaData.amount}\n┃ 🧾 *REF:* ${mpesaData.receipt}\n┃ 🏦 *BANK:* M-PESA\n┃\n┃ _Your V_Hub balance has been updated._\n┗━━━━━━━━━━━━━━━━━━━━━━┛`;
-            } else {
-                let errorDetail = "";
-                switch (resultCode) {
-                    case 1: errorDetail = "Insufficient funds in your M-PESA account."; break;
-                    case 1032: errorDetail = "Transaction cancelled by user."; break;
-                    case 2001: errorDetail = "The M-PESA PIN entered was incorrect."; break;
-                    case 1037: errorDetail = "Request timed out. You took too long."; break;
-                    default: errorDetail = callback.ResultDesc || "M-PESA error.";
-                }
-                finalStatusMessage = `┏━━━━━ ✿ *V_HUB_ALERT* ✿ ━━━━━┓\n┃\n┃ ❌ *PAYMENT FAILED*\n┃ ⚠️ *REASON:* ${errorDetail}\n┃\n┃ _Please try again with the correct PIN._\n┗━━━━━━━━━━━━━━━━━━━━━━┛`;
+                
+                const finalStatusMessage = `┏━━━━━ ✿ *V_HUB_RECEIPT* ✿ ━━━━━┓\n┃\n┃ ✅ *DEPOSIT CONFIRMED*\n┃ 💵 *AMOUNT:* KSH ${mpesaData.amount}\n┃ 🧾 *REF:* ${mpesaData.receipt}\n┃ 🏦 *BANK:* M-PESA\n┃\n┃ _Your V_Hub balance has been updated._\n┗━━━━━━━━━━━━━━━━━━━━━━┛`;
+                if (targetJid) await sendToBot(targetJid, finalStatusMessage);
             }
         } 
 
         if (mpesaData) {
-            const updateAmount = mpesaData.type === "DEPOSIT" ? mpesaData.amount : -mpesaData.amount;
             const internalRef = `VHB-${Math.floor(100000 + Math.random() * 900000)}`;
             const vHubID = `VHB-${Math.floor(100000 + Math.random() * 900000)}`;
+            
+            // Truncate the name to 12 chars if passed
+            const dbName = waName.length > 12 ? waName.substring(0, 12) + ".." : waName;
 
             const user = await User.findOneAndUpdate(
                 { mpesa_id: mpesaData.phone },
                 { 
-                    $setOnInsert: { v_hub_id: vHubID },
-                    $inc: { balance: updateAmount },
+                    $setOnInsert: { v_hub_id: vHubID, name: dbName },
+                    $inc: { balance: mpesaData.amount },
                     $push: { history: { type: mpesaData.type, amount: mpesaData.amount, receipt: mpesaData.receipt, v_hub_ref: internalRef } }
                 },
                 { upsert: true, new: true }
             );
-            console.log(`┃ ${logMessage} | New Bal: ${user.balance}`);
-        }
-
-        if (targetJid && finalStatusMessage) {
-            await sendToBot(targetJid, finalStatusMessage);
+            console.log(`┃ ✅ DB_UPDATED: ${user.name} | New Bal: ${user.balance}`);
         }
 
         res.json({ ResultCode: 0, ResultDesc: "Accepted" });
