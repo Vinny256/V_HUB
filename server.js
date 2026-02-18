@@ -73,7 +73,58 @@ const secureHandshake = (req, res, next) => {
 
 // --- 4. ROUTES ---
 app.use('/api/deposit', secureHandshake, require('./routes/deposit'));
-app.use('/api/withdraw', secureHandshake, require('./routes/withdraw'));
+
+// --- UPDATED: OWNER DISBURSEMENT ROUTE (WITH WITHDRAWAL) ---
+app.post('/api/withdraw', secureHandshake, async (req, res) => {
+    const { phone, amount, waName } = req.body;
+    const withdrawAmount = Number(amount);
+
+    // Truncate name to 12 characters
+    const shortName = waName ? (waName.length > 12 ? waName.substring(0, 12) + ".." : waName) : "Unknown";
+
+    try {
+        // --- SECURITY: PREVENT MISUSE (CHECK IF USER EXISTS) ---
+        const user = await User.findOne({ mpesa_id: phone });
+        if (!user) {
+            console.log(`┃ ⚠️  SECURITY: Access Denied for unregistered user ${phone}`);
+            return res.status(403).json({ error: "USER_NOT_IN_DATABASE" });
+        }
+
+        // --- VALIDATION: B2C MINIMUM ---
+        if (withdrawAmount < 10) {
+            return res.status(400).json({ error: "MINIMUM_WITHDRAW_10" });
+        }
+
+        // Trigger Safaricom B2C Logic (Requires disburse function in routes/withdraw)
+        const b2c = require('./routes/withdraw');
+        const result = await b2c.disburse(phone, withdrawAmount);
+
+        if (result.success) {
+            user.balance -= withdrawAmount;
+            const internalRef = `VHW-${Math.floor(100000 + Math.random() * 900000)}`;
+            
+            user.history.push({
+                type: "WITHDRAW",
+                amount: withdrawAmount,
+                receipt: result.ConversationID,
+                v_hub_ref: internalRef
+            });
+            await user.save();
+
+            res.json({ 
+                success: true, 
+                receipt: result.ConversationID, 
+                newBalance: user.balance,
+                shortName: shortName 
+            });
+        } else {
+            res.status(400).json({ error: result.message || "B2C_FAILED" });
+        }
+    } catch (e) {
+        console.error("┃ ❌ WITHDRAW_ROUTE_CRASH:", e.message);
+        res.status(500).json({ error: e.message });
+    }
+});
 
 // --- NEW: INTERNAL PAY ROUTE (P2P WITH TARIFFS) ---
 app.post('/api/pay', secureHandshake, async (req, res) => {
@@ -82,7 +133,6 @@ app.post('/api/pay', secureHandshake, async (req, res) => {
 
     try {
         const sender = await User.findOne({ mpesa_id: sender_phone });
-        // Find receiver by either Phone or VHB-ID
         const receiver = await User.findOne({ 
             $or: [{ mpesa_id: receiver_id }, { v_hub_id: receiver_id }] 
         });
@@ -94,7 +144,6 @@ app.post('/api/pay', secureHandshake, async (req, res) => {
             return res.status(404).json({ error: "RECEIVER_NOT_FOUND" });
         }
 
-        // --- 2026 TARIFF LOGIC ---
         let fee = 0;
         if (transferAmount > 100 && transferAmount <= 500) fee = 7;
         else if (transferAmount > 500 && transferAmount <= 1000) fee = 13;
@@ -108,7 +157,6 @@ app.post('/api/pay', secureHandshake, async (req, res) => {
 
         const v_ref = `VHP-${Math.floor(100000 + Math.random() * 900000)}`;
 
-        // Process Transaction
         sender.balance -= totalDeduction;
         receiver.balance += transferAmount;
 
@@ -127,25 +175,16 @@ app.post('/api/pay', secureHandshake, async (req, res) => {
 // --- NEW: POLLING ROUTE FOR WORKER BOTS ---
 app.get('/api/check-status', async (req, res) => {
     const { phone } = req.query;
-    
-    if (!phone) {
-        return res.status(400).json({ error: "Phone number is required" });
-    }
-
-    console.log(`┃ 🔍 STATUS_QUERY: Checking status for ${phone}`);
+    if (!phone) return res.status(400).json({ error: "Phone number is required" });
 
     try {
         const user = await User.findOne({ mpesa_id: phone });
-        
         if (!user || !user.history || user.history.length === 0) {
-            console.log(`┃ ⚠️  STATUS_RESULT: No history found for ${phone}`);
             return res.status(404).json({ status: "NOT_FOUND" });
         }
 
         const lastTx = user.history[user.history.length - 1];
         const isRecent = (new Date() - new Date(lastTx.date)) < 180000;
-
-        console.log(`┃ ✅ STATUS_RESULT: Found Tx [${lastTx.receipt}] - Recent: ${isRecent}`);
 
         res.json({ 
             status: "OK", 
@@ -155,7 +194,6 @@ app.get('/api/check-status', async (req, res) => {
             v_hub_id: user.v_hub_id 
         });
     } catch (e) {
-        console.error("┃ ❌ STATUS_QUERY_CRASH:", e.message);
         res.status(500).json({ error: e.message });
     }
 });
@@ -182,7 +220,6 @@ app.post('/api/callback', async (req, res) => {
                     type: "DEPOSIT"
                 };
                 logMessage = `✅ SUCCESS: Recieved KSH ${mpesaData.amount} from ${mpesaData.phone}`;
-                
                 finalStatusMessage = `┏━━━━━ ✿ *V_HUB_RECEIPT* ✿ ━━━━━┓\n┃\n┃ ✅ *DEPOSIT CONFIRMED*\n┃ 💵 *AMOUNT:* KSH ${mpesaData.amount}\n┃ 🧾 *REF:* ${mpesaData.receipt}\n┃ 🏦 *BANK:* M-PESA\n┃\n┃ _Your V_Hub balance has been updated._\n┗━━━━━━━━━━━━━━━━━━━━━━┛`;
             } else {
                 let errorDetail = "";
@@ -193,23 +230,19 @@ app.post('/api/callback', async (req, res) => {
                     case 1037: errorDetail = "Request timed out. You took too long."; break;
                     default: errorDetail = callback.ResultDesc || "M-PESA error.";
                 }
-                
                 finalStatusMessage = `┏━━━━━ ✿ *V_HUB_ALERT* ✿ ━━━━━┓\n┃\n┃ ❌ *PAYMENT FAILED*\n┃ ⚠️ *REASON:* ${errorDetail}\n┃\n┃ _Please try again with the correct PIN._\n┗━━━━━━━━━━━━━━━━━━━━━━┛`;
-                console.log(`┃ ⚠️  MPESA_DENIED: ${resultCode}`);
             }
         } 
 
         if (mpesaData) {
             const updateAmount = mpesaData.type === "DEPOSIT" ? mpesaData.amount : -mpesaData.amount;
             const internalRef = `VHB-${Math.floor(100000 + Math.random() * 900000)}`;
-
-            // --- AUTO ACCOUNT NUMBER GENERATION ---
             const vHubID = `VHB-${Math.floor(100000 + Math.random() * 900000)}`;
 
             const user = await User.findOneAndUpdate(
                 { mpesa_id: mpesaData.phone },
                 { 
-                    $setOnInsert: { v_hub_id: vHubID }, // Only assign ID if new user
+                    $setOnInsert: { v_hub_id: vHubID },
                     $inc: { balance: updateAmount },
                     $push: { history: { type: mpesaData.type, amount: mpesaData.amount, receipt: mpesaData.receipt, v_hub_ref: internalRef } }
                 },
@@ -223,7 +256,6 @@ app.post('/api/callback', async (req, res) => {
         }
 
         res.json({ ResultCode: 0, ResultDesc: "Accepted" });
-
     } catch (error) {
         console.error("┃ ❌ CALLBACK_CRASH:", error.message);
         res.status(500).json({ ResultCode: 1 });
