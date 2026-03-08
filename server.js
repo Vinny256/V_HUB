@@ -6,20 +6,21 @@ require('dotenv').config();
 const app = express();
 app.use(express.json());
 
-// --- 0. BOT WEBHOOK CONFIG (HARDCODED AS REQUESTED) ---
-const BOT_URL = "https://gggg-b9d7fbe20737.herokuapp.com"; 
-const BOT_WEBHOOK = `${BOT_URL}/v_hub_notify`;
-
-// Helper to send styled responses back to WhatsApp
-const sendToBot = async (jid, text) => {
+// --- 0. BOT WEBHOOK CONFIG (NOW DYNAMIC) ---
+// We keep the original helper but update it to accept a dynamic URL
+const sendToBot = async (jid, text, dynamicUrl) => {
     try {
-        await axios.post(BOT_WEBHOOK, { jid, text }, {
+        // Use the dynamicUrl passed from the callback, fallback to hardcoded if needed
+        const targetUrl = dynamicUrl || "https://gggg-b9d7fbe20737.herokuapp.com";
+        const webhookPath = `${targetUrl.replace(/\/$/, "")}/v_hub_notify`;
+
+        await axios.post(webhookPath, { jid, text }, {
             headers: { 
                 'x-vhub-secret': process.env.API_SECRET,
                 'Content-Type': 'application/json'
             }
         });
-        console.log(`┃ ✅ NOTIFY_SENT: Message pushed to Bot for JID: ${jid}`);
+        console.log(`┃ ✅ NOTIFY_SENT: Message pushed to Bot [${targetUrl}] for JID: ${jid}`);
     } catch (e) {
         console.error("┃ ❌ BOT_NOTIFY_FAILED:", e.response?.status || e.message);
     }
@@ -175,18 +176,19 @@ app.post('/api/pay', secureHandshake, async (req, res) => {
     }
 });
 
-// POLLING ROUTE REMOVED TO PREVENT LOG SPAM (SWITCHED TO WEBHOOK PUSH)
-
-// --- 5. THE ULTIMATE CALLBACK (M-PESA 7-POINT LISTENER) ---
+// --- 5. THE ULTIMATE CALLBACK (M-PESA 7-POINT DYNAMIC LISTENER) ---
 app.post('/api/callback', async (req, res) => {
     try {
         const body = req.body.Body;
         let targetJid = req.query.jid; 
         let waName = req.query.name || "V_Hub Member";
         let vHubRefFromBot = req.query.ref; 
+        
+        // CAPTURE THE BOT'S OWN URL DYNAMICALLY FROM QUERY
+        let botBaseUrl = req.query.callbackUrl; 
 
         if (targetJid) {
-            await sendToBot(targetJid, "⏳ *ᴠ-ʜᴜʙ:* ᴘᴀʏᴍᴇɴᴛ ᴅᴇᴛᴇᴄᴛᴇᴅ. ᴜᴘᴅᴀᴛɪɴɢ ʏᴏᴜʀ ᴡᴀʟʟᴇᴛ, ᴘʟᴇᴀsᴇ ᴡᴀɪᴛ...");
+            await sendToBot(targetJid, "⏳ *ᴠ-ʜᴜʙ:* ᴘᴀʏᴍᴇɴᴛ ᴅᴇᴛᴇᴄᴛᴇᴅ. ᴜᴘᴅᴀᴛɪɴɢ ʏᴏᴜʀ ᴡᴀʟʟᴇᴛ, ᴘʟᴇᴀsᴇ ᴡᴀɪᴛ...", botBaseUrl);
         }
 
         if (body && body.stkCallback) {
@@ -194,16 +196,14 @@ app.post('/api/callback', async (req, res) => {
             const resultCode = callback.ResultCode;
             const resultDesc = callback.ResultDesc;
 
-            // --- CASE A: SUCCESS (ResultCode 0) ---
             if (resultCode === 0) {
                 const meta = callback.CallbackMetadata.Item;
-                let extractedPhone, extractedAmount, extractedReceipt, transDate;
+                let extractedPhone, extractedAmount, extractedReceipt;
                 
                 meta.forEach(item => {
                     if (item.Name === "PhoneNumber") extractedPhone = item.Value.toString();
                     if (item.Name === "Amount") extractedAmount = item.Value;
                     if (item.Name === "MpesaReceiptNumber") extractedReceipt = item.Value;
-                    if (item.Name === "TransactionDate") transDate = item.Value;
                 });
 
                 const finalPhone = extractedPhone || meta[meta.length - 1].Value.toString();
@@ -231,23 +231,16 @@ app.post('/api/callback', async (req, res) => {
                         });
                     }
 
-                    // --- 🏦 DUAL NOTIFICATION SYSTEM ---
-                    // 1. Raw M-Pesa Style Confirmation
                     const mpesaStyle = `*${extractedReceipt} Confirmed.* Ksh${extractedAmount}.00 received from ${finalPhone} on ${new Date().toLocaleDateString()} at ${new Date().toLocaleTimeString()}. New V-HUB balance is Ksh${user.balance}.`;
-                    
-                    // 2. Branded V-HUB Receipt
                     const vhubReceipt = `┏━━━━━ ✿ *ᴠ-ʜᴜʙ_ʀᴇᴄᴇɪᴘᴛ* ✿ ━━━━━┓\n┃\n┃ ✅ *ᴅᴇᴘᴏsɪᴛ sᴜᴄᴄᴇssꜰᴜʟ*\n┃ 👤 *ᴄᴜsᴛᴏᴍᴇʀ:* ${user.name}\n┃ 💵 *ᴀᴍᴏᴜɴᴛ:* ᴋsʜ ${extractedAmount}\n┃ 📅 *ᴛɪᴍᴇ:* ${new Date().toLocaleTimeString()}\n┃\n┣━━━━━━━━━━━━━━━━━━━━━━┫\n┃\n┃ 🏦 *ᴠ-ʜᴜʙ ʙᴀʟ:* ᴋsʜ ${user.balance}\n┃ 🆔 *ᴡᴀʟʟᴇᴛ ɪᴅ:* ${user.v_hub_id}\n┃ 📱 *ᴍ-ᴘᴇsᴀ ʀᴇꜰ:* ${extractedReceipt}\n┃\n┣━━━━━━━━━━━━━━━━━━━━━━┫\n┃ _ᴛʜᴀɴᴋ ʏᴏᴜ ꜰᴏʀ ʙᴀɴᴋɪɴɢ ᴡɪᴛʜ ᴜs_\n┗━━━━━━━━━━━━━━━━━━━━━━┛`;
 
                     if (targetJid) {
-                        await sendToBot(targetJid, mpesaStyle);
-                        await sendToBot(targetJid, vhubReceipt);
+                        await sendToBot(targetJid, mpesaStyle, botBaseUrl);
+                        await sendToBot(targetJid, vhubReceipt, botBaseUrl);
                     }
                 }
-            } 
-            // --- CASE B: THE SAFARICOM 7 ERROR SUITE ---
-            else {
+            } else {
                 let errorReason = "ᴛʀᴀɴsᴀᴄᴛɪᴏɴ ꜰᴀɪʟᴇᴅ";
-                
                 switch(resultCode) {
                     case 1: errorReason = "ɪɴsᴜꜰꜰɪᴄɪᴇɴᴛ ꜰᴜɴᴅs ɪɴ ᴍ-ᴘᴇsᴀ."; break;
                     case 1032: errorReason = "ʀᴇǫᴜᴇsᴛ ᴄᴀɴᴄᴇʟʟᴇᴅ ʙʏ ᴜsᴇʀ."; break;
@@ -257,12 +250,10 @@ app.post('/api/callback', async (req, res) => {
                     case 1019: errorReason = "ᴛʀᴀɴsᴀᴄᴛɪᴏɴ ᴇxᴘɪʀᴇᴅ/ʙʟᴏᴄᴋᴇᴅ."; break;
                     default: errorReason = resultDesc;
                 }
-
                 const errorMsg = `┏━━━━━ ✿ *ᴠ-ʜᴜʙ_ᴀʟᴇʀᴛ* ✿ ━━━━━┓\n┃\n┃ ❌ *ᴛʀᴀɴsᴀᴄᴛɪᴏɴ ꜰᴀɪʟᴇᴅ*\n┃ 🆔 *ʀᴇꜰ:* ${vHubRefFromBot || 'ɢᴜᴇsᴛ'}\n┃\n┣━━━━━━━━━━━━━━━━━━━━━━┫\n┃\n┃ ⚠️ *ʀᴇᴀsᴏɴ:*\n┃ ${errorReason}\n┃\n┣━━━━━━━━━━━━━━━━━━━━━━┫\n┃ _ᴘʟᴇᴀsᴇ ᴛʀʏ ᴀɢᴀɪɴ ᴡɪᴛʜ ᴄᴏʀʀᴇᴄᴛ ɪɴꜰᴏ_\n┗━━━━━━━━━━━━━━━━━━━━━━┛`;
-                if (targetJid) await sendToBot(targetJid, errorMsg);
+                if (targetJid) await sendToBot(targetJid, errorMsg, botBaseUrl);
             }
         }
-
         res.json({ ResultCode: 0, ResultDesc: "Accepted" });
     } catch (error) {
         console.error("┃ ❌ CALLBACK_CRASH:", error.message);
@@ -275,7 +266,7 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     console.log(`\n┏━━━━━ ✿ V_HUB_PROXY_LIVE ✿ ━━━━━┓`);
     console.log(`┃  PORT: ${PORT}                      ┃`);
-    console.log(`┃  STAT: PUSH_NOTIFY_ACTIVE       ┃`);
+    console.log(`┃  STAT: DYNAMIC_WEBHOOK_READY    ┃`);
     console.log(`┃  DB:   CONNECTED_TO_ATLAS       ┃`);
     console.log(`┗━━━━━ ✿ INFINITE_IMPACT ✿ ━━━━━┛`);
 });
