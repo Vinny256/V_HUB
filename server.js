@@ -216,14 +216,18 @@ app.get('/api/check-status', async (req, res) => {
     }
 });
 
-// --- 5. THE ULTIMATE CALLBACK (M-PESA LISTENER + ERROR HANDLING) ---
+// --- 5. THE ULTIMATE CALLBACK (M-PESA LISTENER + ERROR HANDLING + PROCESSING) ---
 app.post('/api/callback', async (req, res) => {
     try {
         const body = req.body.Body;
-        let mpesaData = null;
         let targetJid = req.query.jid; 
         let waName = req.query.name || "V_Hub Member";
         let vHubRefFromBot = req.query.ref; 
+
+        // Send an immediate "Processing" notification to the bot
+        if (targetJid) {
+            await sendToBot(targetJid, "⏳ *ᴠ-ʜᴜʙ:* ᴘᴀʏᴍᴇɴᴛ ᴅᴇᴛᴇᴄᴛᴇᴅ. ᴜᴘᴅᴀᴛɪɴɢ ʏᴏᴜʀ ᴡᴀʟʟᴇᴛ, ᴘʟᴇᴀsᴇ ᴡᴀɪᴛ...");
+        }
 
         if (body && body.stkCallback) {
             const callback = body.stkCallback;
@@ -233,50 +237,43 @@ app.post('/api/callback', async (req, res) => {
             // --- CASE A: SUCCESS (ResultCode 0) ---
             if (resultCode === 0) {
                 const meta = callback.CallbackMetadata.Item;
-                // --- FORCED EXTRACTION LOOP FOR RELIABILITY ---
-                let extractedPhone, extractedAmount, extractedReceipt;
                 
+                // --- ROBUST EXTRACTION ---
+                let extractedPhone, extractedAmount, extractedReceipt;
                 meta.forEach(item => {
                     if (item.Name === "PhoneNumber") extractedPhone = item.Value.toString();
                     if (item.Name === "Amount") extractedAmount = item.Value;
                     if (item.Name === "MpesaReceiptNumber") extractedReceipt = item.Value;
                 });
 
-                mpesaData = {
-                    phone: extractedPhone,
-                    amount: extractedAmount,
-                    receipt: extractedReceipt,
-                    type: "DEPOSIT"
-                };
-
-                if (mpesaData.phone) {
+                if (extractedPhone) {
                     const internalRef = `VHB-${Math.floor(100000 + Math.random() * 900000)}`;
                     const vHubID_New = `VHB-${Math.floor(100000 + Math.random() * 900000)}`;
                     const dbName = waName.length > 12 ? waName.substring(0, 12) + ".." : waName;
 
                     let user = await User.findOne({ 
-                        $or: [ { v_hub_id: vHubRefFromBot }, { mpesa_id: mpesaData.phone } ] 
+                        $or: [ { v_hub_id: vHubRefFromBot }, { mpesa_id: extractedPhone } ] 
                     });
 
                     if (user) {
-                        user.balance += mpesaData.amount;
+                        user.balance += extractedAmount;
                         user.history.push({ 
-                            type: mpesaData.type, amount: mpesaData.amount, receipt: mpesaData.receipt, v_hub_ref: internalRef 
+                            type: "DEPOSIT", amount: extractedAmount, receipt: extractedReceipt, v_hub_ref: internalRef 
                         });
                         await user.save();
                     } else {
                         user = await User.create({
-                            mpesa_id: mpesaData.phone,
+                            mpesa_id: extractedPhone,
                             v_hub_id: vHubRefFromBot || vHubID_New,
                             name: dbName,
-                            balance: mpesaData.amount,
-                            history: [{ type: mpesaData.type, amount: mpesaData.amount, receipt: mpesaData.receipt, v_hub_ref: internalRef }]
+                            balance: extractedAmount,
+                            history: [{ type: "DEPOSIT", amount: extractedAmount, receipt: extractedReceipt, v_hub_ref: internalRef }]
                         });
                     }
 
                     console.log(`┃ ✅ DB_UPDATED: ${user.name} | New Bal: ${user.balance}`);
 
-                    const successMsg = `┏━━━━━ ✿ *ᴠ-ʜᴜʙ_ʀᴇᴄᴇɪᴘᴛ* ✿ ━━━━━┓\n┃\n┃ ✅ *ᴅᴇᴘᴏsɪᴛ sᴜᴄᴄᴇssꜰᴜʟ*\n┃ 👤 *ᴄᴜsᴛᴏᴍᴇʀ:* ${user.name}\n┃ 💵 *ᴀᴍᴏᴜɴᴛ:* ᴋsʜ ${mpesaData.amount}\n┃ 📅 *ᴛɪᴍᴇ:* ${new Date().toLocaleTimeString()}\n┃\n┣━━━━━━━━━━━━━━━━━━━━━━┫\n┃\n┃ 🏦 *ᴠ-ʜᴜʙ ʙᴀʟ:* ᴋsʜ ${user.balance}\n┃ 🆔 *ᴡᴀʟʟᴇᴛ ɪᴅ:* ${user.v_hub_id}\n┃ 📱 *ᴍ-ᴘᴇsᴀ ʀᴇꜰ:* ${mpesaData.receipt}\n┃\n┣━━━━━━━━━━━━━━━━━━━━━━┫\n┃ _ᴛʜᴀɴᴋ ʏᴏᴜ ꜰᴏʀ ʙᴀɴᴋɪɴɢ ᴡɪᴛʜ ᴜs_\n┗━━━━━━━━━━━━━━━━━━━━━━┛`;
+                    const successMsg = `┏━━━━━ ✿ *ᴠ-ʜᴜʙ_ʀᴇᴄᴇɪᴘᴛ* ✿ ━━━━━┓\n┃\n┃ ✅ *ᴅᴇᴘᴏsɪᴛ sᴜᴄᴄᴇssꜰᴜʟ*\n┃ 👤 *ᴄᴜsᴛᴏᴍᴇʀ:* ${user.name}\n┃ 💵 *ᴀᴍᴏᴜɴᴛ:* ᴋsʜ ${extractedAmount}\n┃ 📅 *ᴛɪᴍᴇ:* ${new Date().toLocaleTimeString()}\n┃\n┣━━━━━━━━━━━━━━━━━━━━━━┫\n┃\n┃ 🏦 *ᴠ-ʜᴜʙ ʙᴀʟ:* ᴋsʜ ${user.balance}\n┃ 🆔 *ᴡᴀʟʟᴇᴛ ɪᴅ:* ${user.v_hub_id}\n┃ 📱 *ᴍ-ᴘᴇsᴀ ʀᴇꜰ:* ${extractedReceipt}\n┃\n┣━━━━━━━━━━━━━━━━━━━━━━┫\n┃ _ᴛʜᴀɴᴋ ʏᴏᴜ ꜰᴏʀ ʙᴀɴᴋɪɴɢ ᴡɪᴛʜ ᴜs_\n┗━━━━━━━━━━━━━━━━━━━━━━┛`;
                     if (targetJid) await sendToBot(targetJid, successMsg);
                 }
             } 
