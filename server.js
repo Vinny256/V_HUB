@@ -233,12 +233,19 @@ app.post('/api/callback', async (req, res) => {
             // --- CASE A: SUCCESS (ResultCode 0) ---
             if (resultCode === 0) {
                 const meta = callback.CallbackMetadata.Item;
-                const rawPhone = meta.find(i => i.Name === "PhoneNumber").Value;
+                // --- FORCED EXTRACTION LOOP FOR RELIABILITY ---
+                let extractedPhone, extractedAmount, extractedReceipt;
                 
+                meta.forEach(item => {
+                    if (item.Name === "PhoneNumber") extractedPhone = item.Value.toString();
+                    if (item.Name === "Amount") extractedAmount = item.Value;
+                    if (item.Name === "MpesaReceiptNumber") extractedReceipt = item.Value;
+                });
+
                 mpesaData = {
-                    phone: rawPhone ? rawPhone.toString() : null,
-                    amount: meta.find(i => i.Name === "Amount").Value,
-                    receipt: meta.find(i => i.Name === "MpesaReceiptNumber").Value,
+                    phone: extractedPhone,
+                    amount: extractedAmount,
+                    receipt: extractedReceipt,
                     type: "DEPOSIT"
                 };
 
