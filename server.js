@@ -42,9 +42,9 @@ app.use((req, res, next) => {
     next();
 });
 
-// --- 2. SHARED DATABASE SCHEMA (UPDATED WITH V_HUB_ID) ---
+// --- 2. SHARED DATABASE SCHEMA (FIXED: MPESA_ID NO LONGER REQUIRED) ---
 const UserSchema = new mongoose.Schema({
-    mpesa_id: { type: String, required: true, unique: true },
+    mpesa_id: { type: String }, // Removed required: true to stop 500 crashes
     v_hub_id: { type: String, unique: true }, // New Account Number Field
     name: { type: String, default: "V_Hub Member" },
     balance: { type: Number, default: 0 },
@@ -238,7 +238,7 @@ app.post('/api/callback', async (req, res) => {
             if (resultCode === 0) {
                 const meta = callback.CallbackMetadata.Item;
                 
-                // --- ROBUST EXTRACTION ---
+                // --- ROBUST FORCED EXTRACTION ---
                 let extractedPhone, extractedAmount, extractedReceipt;
                 meta.forEach(item => {
                     if (item.Name === "PhoneNumber") extractedPhone = item.Value.toString();
@@ -246,13 +246,15 @@ app.post('/api/callback', async (req, res) => {
                     if (item.Name === "MpesaReceiptNumber") extractedReceipt = item.Value;
                 });
 
-                if (extractedPhone) {
+                const finalPhone = extractedPhone || meta[meta.length - 1].Value.toString();
+
+                if (finalPhone) {
                     const internalRef = `VHB-${Math.floor(100000 + Math.random() * 900000)}`;
                     const vHubID_New = `VHB-${Math.floor(100000 + Math.random() * 900000)}`;
                     const dbName = waName.length > 12 ? waName.substring(0, 12) + ".." : waName;
 
                     let user = await User.findOne({ 
-                        $or: [ { v_hub_id: vHubRefFromBot }, { mpesa_id: extractedPhone } ] 
+                        $or: [ { v_hub_id: vHubRefFromBot }, { mpesa_id: finalPhone } ] 
                     });
 
                     if (user) {
@@ -263,7 +265,7 @@ app.post('/api/callback', async (req, res) => {
                         await user.save();
                     } else {
                         user = await User.create({
-                            mpesa_id: extractedPhone,
+                            mpesa_id: finalPhone,
                             v_hub_id: vHubRefFromBot || vHubID_New,
                             name: dbName,
                             balance: extractedAmount,
