@@ -231,8 +231,11 @@ app.post('/api/callback', async (req, res) => {
 
             if (resultCode === 0) {
                 const meta = callback.CallbackMetadata.Item;
+                // --- CRITICAL FIX: MANUALLY MAP PHONE TO PREVENT mpesa_id ERROR ---
+                const rawPhone = meta.find(i => i.Name === "PhoneNumber").Value;
+                
                 mpesaData = {
-                    phone: meta.find(i => i.Name === "PhoneNumber").Value.toString(),
+                    phone: rawPhone ? rawPhone.toString() : null,
                     amount: meta.find(i => i.Name === "Amount").Value,
                     receipt: meta.find(i => i.Name === "MpesaReceiptNumber").Value,
                     type: "DEPOSIT"
@@ -240,13 +243,14 @@ app.post('/api/callback', async (req, res) => {
             }
         } 
 
-        if (mpesaData) {
+        if (mpesaData && mpesaData.phone) {
             const internalRef = `VHB-${Math.floor(100000 + Math.random() * 900000)}`;
             const vHubID_New = `VHB-${Math.floor(100000 + Math.random() * 900000)}`;
+            
+            // Truncate the name to 12 chars if passed
             const dbName = waName.length > 12 ? waName.substring(0, 12) + ".." : waName;
 
-            // --- 🚀 THE MASTER FIX: DOUBLE CREDIT LOGIC 🚀 ---
-            // 1. First, find the user by VH-ID (if it was passed) OR by Phone
+            // --- 🚀 THE MASTER FIX: SEARCH BY REF FIRST, THEN PHONE 🚀 ---
             let user = await User.findOne({ 
                 $or: [
                     { v_hub_id: vHubRefFromBot }, 
@@ -267,7 +271,7 @@ app.post('/api/callback', async (req, res) => {
             } else {
                 // Create new user if neither ID nor Phone exists
                 user = await User.create({
-                    mpesa_id: mpesaData.phone,
+                    mpesa_id: mpesaData.phone, // Ensures Schema validation passes
                     v_hub_id: vHubRefFromBot || vHubID_New,
                     name: dbName,
                     balance: mpesaData.amount,
