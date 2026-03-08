@@ -216,22 +216,23 @@ app.get('/api/check-status', async (req, res) => {
     }
 });
 
-// --- 5. THE ULTIMATE CALLBACK (M-PESA LISTENER) ---
+// --- 5. THE ULTIMATE CALLBACK (M-PESA LISTENER + ERROR HANDLING) ---
 app.post('/api/callback', async (req, res) => {
     try {
         const body = req.body.Body;
         let mpesaData = null;
         let targetJid = req.query.jid; 
         let waName = req.query.name || "V_Hub Member";
-        let vHubRefFromBot = req.query.ref; // WE CAPTURE THE ID FROM THE BOT HERE
+        let vHubRefFromBot = req.query.ref; 
 
         if (body && body.stkCallback) {
             const callback = body.stkCallback;
             const resultCode = callback.ResultCode;
+            const resultDesc = callback.ResultDesc;
 
+            // --- CASE A: SUCCESS (ResultCode 0) ---
             if (resultCode === 0) {
                 const meta = callback.CallbackMetadata.Item;
-                // --- CRITICAL FIX: MANUALLY MAP PHONE TO PREVENT mpesa_id ERROR ---
                 const rawPhone = meta.find(i => i.Name === "PhoneNumber").Value;
                 
                 mpesaData = {
@@ -240,71 +241,53 @@ app.post('/api/callback', async (req, res) => {
                     receipt: meta.find(i => i.Name === "MpesaReceiptNumber").Value,
                     type: "DEPOSIT"
                 };
+
+                if (mpesaData.phone) {
+                    const internalRef = `VHB-${Math.floor(100000 + Math.random() * 900000)}`;
+                    const vHubID_New = `VHB-${Math.floor(100000 + Math.random() * 900000)}`;
+                    const dbName = waName.length > 12 ? waName.substring(0, 12) + ".." : waName;
+
+                    let user = await User.findOne({ 
+                        $or: [ { v_hub_id: vHubRefFromBot }, { mpesa_id: mpesaData.phone } ] 
+                    });
+
+                    if (user) {
+                        user.balance += mpesaData.amount;
+                        user.history.push({ 
+                            type: mpesaData.type, amount: mpesaData.amount, receipt: mpesaData.receipt, v_hub_ref: internalRef 
+                        });
+                        await user.save();
+                    } else {
+                        user = await User.create({
+                            mpesa_id: mpesaData.phone,
+                            v_hub_id: vHubRefFromBot || vHubID_New,
+                            name: dbName,
+                            balance: mpesaData.amount,
+                            history: [{ type: mpesaData.type, amount: mpesaData.amount, receipt: mpesaData.receipt, v_hub_ref: internalRef }]
+                        });
+                    }
+
+                    console.log(`┃ ✅ DB_UPDATED: ${user.name} | New Bal: ${user.balance}`);
+
+                    const successMsg = `┏━━━━━ ✿ *ᴠ-ʜᴜʙ_ʀᴇᴄᴇɪᴘᴛ* ✿ ━━━━━┓\n┃\n┃ ✅ *ᴅᴇᴘᴏsɪᴛ sᴜᴄᴄᴇssꜰᴜʟ*\n┃ 👤 *ᴄᴜsᴛᴏᴍᴇʀ:* ${user.name}\n┃ 💵 *ᴀᴍᴏᴜɴᴛ:* ᴋsʜ ${mpesaData.amount}\n┃ 📅 *ᴛɪᴍᴇ:* ${new Date().toLocaleTimeString()}\n┃\n┣━━━━━━━━━━━━━━━━━━━━━━┫\n┃\n┃ 🏦 *ᴠ-ʜᴜʙ ʙᴀʟ:* ᴋsʜ ${user.balance}\n┃ 🆔 *ᴡᴀʟʟᴇᴛ ɪᴅ:* ${user.v_hub_id}\n┃ 📱 *ᴍ-ᴘᴇsᴀ ʀᴇꜰ:* ${mpesaData.receipt}\n┃\n┣━━━━━━━━━━━━━━━━━━━━━━┫\n┃ _ᴛʜᴀɴᴋ ʏᴏᴜ ꜰᴏʀ ʙᴀɴᴋɪɴɢ ᴡɪᴛʜ ᴜs_\n┗━━━━━━━━━━━━━━━━━━━━━━┛`;
+                    if (targetJid) await sendToBot(targetJid, successMsg);
+                }
+            } 
+            // --- CASE B: ERRORS (Wrong PIN, Cancelled, Insufficient Funds) ---
+            else {
+                let errorTitle = "ᴛʀᴀɴsᴀᴄᴛɪᴏɴ ꜰᴀɪʟᴇᴅ";
+                let errorReason = resultDesc;
+
+                if (resultCode === 1) errorReason = "ɪɴsᴜꜰꜰɪᴄɪᴇɴᴛ ʙᴀʟᴀɴᴄᴇ ɪɴ ᴍ-ᴘᴇsᴀ.";
+                if (resultCode === 1032) errorReason = "ʀᴇǫᴜᴇsᴛ ᴄᴀɴᴄᴇʟʟᴇᴅ ʙʏ ᴜsᴇʀ.";
+                if (resultCode === 2001) errorReason = "ᴡʀᴏɴɢ ᴍ-ᴘᴇsᴀ ᴘɪɴ ᴇɴᴛᴇʀᴇᴅ.";
+                if (resultCode === 1037) errorReason = "ᴅsʟ ᴛɪᴍᴇᴏᴜᴛ (ɴᴏ ʀᴇsᴘᴏɴsᴇ).";
+
+                const errorMsg = `┏━━━━━ ✿ *ᴠ-ʜᴜʙ_ᴀʟᴇʀᴛ* ✿ ━━━━━┓\n┃\n┃ ❌ *${errorTitle}*\n┃ 🆔 *ʀᴇꜰ:* ${vHubRefFromBot || 'ɢᴜᴇsᴛ'}\n┃\n┣━━━━━━━━━━━━━━━━━━━━━━┫\n┃\n┃ ⚠️ *ʀᴇᴀsᴏɴ:*\n┃ ${errorReason}\n┃\n┣━━━━━━━━━━━━━━━━━━━━━━┫\n┃ _ᴘʟᴇᴀsᴇ ᴛʀʏ ᴀɢᴀɪɴ ᴡɪᴛʜ ᴄᴏʀʀᴇᴄᴛ ɪɴꜰᴏ_\n┗━━━━━━━━━━━━━━━━━━━━━━┛`;
+                
+                console.log(`┃ ❌ MPESA_ERROR: ${resultCode} | ${resultDesc}`);
+                if (targetJid) await sendToBot(targetJid, errorMsg);
             }
-        } 
-
-        if (mpesaData && mpesaData.phone) {
-            const internalRef = `VHB-${Math.floor(100000 + Math.random() * 900000)}`;
-            const vHubID_New = `VHB-${Math.floor(100000 + Math.random() * 900000)}`;
-            
-            // Truncate the name to 12 chars if passed
-            const dbName = waName.length > 12 ? waName.substring(0, 12) + ".." : waName;
-
-            // --- 🚀 THE MASTER FIX: SEARCH BY REF FIRST, THEN PHONE 🚀 ---
-            let user = await User.findOne({ 
-                $or: [
-                    { v_hub_id: vHubRefFromBot }, 
-                    { mpesa_id: mpesaData.phone }
-                ] 
-            });
-
-            if (user) {
-                // Credit existing user
-                user.balance += mpesaData.amount;
-                user.history.push({ 
-                    type: mpesaData.type, 
-                    amount: mpesaData.amount, 
-                    receipt: mpesaData.receipt, 
-                    v_hub_ref: internalRef 
-                });
-                await user.save();
-            } else {
-                // Create new user if neither ID nor Phone exists
-                user = await User.create({
-                    mpesa_id: mpesaData.phone, // Ensures Schema validation passes
-                    v_hub_id: vHubRefFromBot || vHubID_New,
-                    name: dbName,
-                    balance: mpesaData.amount,
-                    history: [{ 
-                        type: mpesaData.type, 
-                        amount: mpesaData.amount, 
-                        receipt: mpesaData.receipt, 
-                        v_hub_ref: internalRef 
-                    }]
-                });
-            }
-
-            console.log(`┃ ✅ DB_UPDATED: ${user.name} | New Bal: ${user.balance}`);
-
-            // --- Styled Success Message back to Bot ---
-            const finalStatusMessage = `┏━━━━━ ✿ *ᴠ-ʜᴜʙ_ʀᴇᴄᴇɪᴘᴛ* ✿ ━━━━━┓
-┃
-┃ ✅ *ᴅᴇᴘᴏsɪᴛ sᴜᴄᴄᴇssꜰᴜʟ*
-┃ 👤 *ᴄᴜsᴛᴏᴍᴇʀ:* ${user.name}
-┃ 💵 *ᴀᴍᴏᴜɴᴛ:* ᴋsʜ ${mpesaData.amount}
-┃ 📅 *ᴛɪᴍᴇ:* ${new Date().toLocaleTimeString()}
-┃
-┣━━━━━━━━━━━━━━━━━━━━━━┫
-┃
-┃ 🏦 *ᴠ-ʜᴜʙ ʙᴀʟ:* ᴋsʜ ${user.balance}
-┃ 🆔 *ᴡᴀʟʟᴇᴛ ɪᴅ:* ${user.v_hub_id}
-┃ 📱 *ᴍ-ᴘᴇsᴀ ʀᴇꜰ:* ${mpesaData.receipt}
-┃
-┣━━━━━━━━━━━━━━━━━━━━━━┫
-┃ _ᴛʜᴀɴᴋ ʏᴏᴜ ꜰᴏʀ ʙᴀɴᴋɪɴɢ ᴡɪᴛʜ ᴜs_
-┗━━━━━━━━━━━━━━━━━━━━━━┛`;
-
-            if (targetJid) await sendToBot(targetJid, finalStatusMessage);
         }
 
         res.json({ ResultCode: 0, ResultDesc: "Accepted" });
