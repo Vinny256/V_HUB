@@ -79,11 +79,9 @@ app.post('/api/withdraw', secureHandshake, async (req, res) => {
     const { phone, amount, waName } = req.body;
     const withdrawAmount = Number(amount);
 
-    // Truncate name to 12 characters for v_hub consistency
     const shortName = waName ? (waName.length > 12 ? waName.substring(0, 12) + ".." : waName) : "Unknown";
 
     try {
-        // --- SECURITY: PREVENT MISUSE (SMART SEARCH) ---
         const user = await User.findOne({ 
             $or: [
                 { mpesa_id: phone }, 
@@ -97,12 +95,10 @@ app.post('/api/withdraw', secureHandshake, async (req, res) => {
             return res.status(403).json({ error: "USER_NOT_IN_DATABASE" });
         }
 
-        // --- VALIDATION: B2C MINIMUM ---
         if (withdrawAmount < 10) {
             return res.status(400).json({ error: "MINIMUM_WITHDRAW_10" });
         }
 
-        // Trigger Safaricom B2C Logic
         const b2c = require('./routes/withdraw');
         const result = await b2c.disburse(user.mpesa_id, withdrawAmount);
 
@@ -179,44 +175,9 @@ app.post('/api/pay', secureHandshake, async (req, res) => {
     }
 });
 
-// --- UPDATED: SMART SEARCH POLLING ROUTE ---
-app.get('/api/check-status', async (req, res) => {
-    const { phone } = req.query; // Query can be Phone, Name, or ID
-    if (!phone) return res.status(400).json({ error: "Parameter required" });
+// POLLING ROUTE REMOVED TO PREVENT LOG SPAM (SWITCHED TO WEBHOOK PUSH)
 
-    console.log(`┃ 🔍 SMART_SEARCH: Querying [${phone}]`);
-
-    try {
-        const user = await User.findOne({ 
-            $or: [
-                { mpesa_id: phone }, 
-                { v_hub_id: new RegExp(`^${phone}$`, 'i') }, 
-                { name: new RegExp(`^${phone}$`, 'i') }
-            ] 
-        });
-
-        if (!user) {
-            return res.status(404).json({ status: "NOT_FOUND" });
-        }
-
-        const lastTx = user.history.length > 0 ? user.history[user.history.length - 1] : { date: new Date(0) };
-        const isRecent = (new Date() - new Date(lastTx.date)) < 180000;
-
-        res.json({ 
-            status: "OK", 
-            isRecent,
-            balance: user.balance, 
-            lastTransaction: lastTx,
-            v_hub_id: user.v_hub_id,
-            mpesa_id: user.mpesa_id,
-            name: user.name
-        });
-    } catch (e) {
-        res.status(500).json({ error: e.message });
-    }
-});
-
-// --- 5. THE ULTIMATE CALLBACK (M-PESA LISTENER + ERROR HANDLING + PROCESSING) ---
+// --- 5. THE ULTIMATE CALLBACK (M-PESA 7-POINT LISTENER) ---
 app.post('/api/callback', async (req, res) => {
     try {
         const body = req.body.Body;
@@ -224,7 +185,6 @@ app.post('/api/callback', async (req, res) => {
         let waName = req.query.name || "V_Hub Member";
         let vHubRefFromBot = req.query.ref; 
 
-        // Send an immediate "Processing" notification to the bot
         if (targetJid) {
             await sendToBot(targetJid, "⏳ *ᴠ-ʜᴜʙ:* ᴘᴀʏᴍᴇɴᴛ ᴅᴇᴛᴇᴄᴛᴇᴅ. ᴜᴘᴅᴀᴛɪɴɢ ʏᴏᴜʀ ᴡᴀʟʟᴇᴛ, ᴘʟᴇᴀsᴇ ᴡᴀɪᴛ...");
         }
@@ -237,13 +197,13 @@ app.post('/api/callback', async (req, res) => {
             // --- CASE A: SUCCESS (ResultCode 0) ---
             if (resultCode === 0) {
                 const meta = callback.CallbackMetadata.Item;
+                let extractedPhone, extractedAmount, extractedReceipt, transDate;
                 
-                // --- ROBUST FORCED EXTRACTION ---
-                let extractedPhone, extractedAmount, extractedReceipt;
                 meta.forEach(item => {
                     if (item.Name === "PhoneNumber") extractedPhone = item.Value.toString();
                     if (item.Name === "Amount") extractedAmount = item.Value;
                     if (item.Name === "MpesaReceiptNumber") extractedReceipt = item.Value;
+                    if (item.Name === "TransactionDate") transDate = item.Value;
                 });
 
                 const finalPhone = extractedPhone || meta[meta.length - 1].Value.toString();
@@ -259,9 +219,7 @@ app.post('/api/callback', async (req, res) => {
 
                     if (user) {
                         user.balance += extractedAmount;
-                        user.history.push({ 
-                            type: "DEPOSIT", amount: extractedAmount, receipt: extractedReceipt, v_hub_ref: internalRef 
-                        });
+                        user.history.push({ type: "DEPOSIT", amount: extractedAmount, receipt: extractedReceipt, v_hub_ref: internalRef });
                         await user.save();
                     } else {
                         user = await User.create({
@@ -273,25 +231,34 @@ app.post('/api/callback', async (req, res) => {
                         });
                     }
 
-                    console.log(`┃ ✅ DB_UPDATED: ${user.name} | New Bal: ${user.balance}`);
+                    // --- 🏦 DUAL NOTIFICATION SYSTEM ---
+                    // 1. Raw M-Pesa Style Confirmation
+                    const mpesaStyle = `*${extractedReceipt} Confirmed.* Ksh${extractedAmount}.00 received from ${finalPhone} on ${new Date().toLocaleDateString()} at ${new Date().toLocaleTimeString()}. New V-HUB balance is Ksh${user.balance}.`;
+                    
+                    // 2. Branded V-HUB Receipt
+                    const vhubReceipt = `┏━━━━━ ✿ *ᴠ-ʜᴜʙ_ʀᴇᴄᴇɪᴘᴛ* ✿ ━━━━━┓\n┃\n┃ ✅ *ᴅᴇᴘᴏsɪᴛ sᴜᴄᴄᴇssꜰᴜʟ*\n┃ 👤 *ᴄᴜsᴛᴏᴍᴇʀ:* ${user.name}\n┃ 💵 *ᴀᴍᴏᴜɴᴛ:* ᴋsʜ ${extractedAmount}\n┃ 📅 *ᴛɪᴍᴇ:* ${new Date().toLocaleTimeString()}\n┃\n┣━━━━━━━━━━━━━━━━━━━━━━┫\n┃\n┃ 🏦 *ᴠ-ʜᴜʙ ʙᴀʟ:* ᴋsʜ ${user.balance}\n┃ 🆔 *ᴡᴀʟʟᴇᴛ ɪᴅ:* ${user.v_hub_id}\n┃ 📱 *ᴍ-ᴘᴇsᴀ ʀᴇꜰ:* ${extractedReceipt}\n┃\n┣━━━━━━━━━━━━━━━━━━━━━━┫\n┃ _ᴛʜᴀɴᴋ ʏᴏᴜ ꜰᴏʀ ʙᴀɴᴋɪɴɢ ᴡɪᴛʜ ᴜs_\n┗━━━━━━━━━━━━━━━━━━━━━━┛`;
 
-                    const successMsg = `┏━━━━━ ✿ *ᴠ-ʜᴜʙ_ʀᴇᴄᴇɪᴘᴛ* ✿ ━━━━━┓\n┃\n┃ ✅ *ᴅᴇᴘᴏsɪᴛ sᴜᴄᴄᴇssꜰᴜʟ*\n┃ 👤 *ᴄᴜsᴛᴏᴍᴇʀ:* ${user.name}\n┃ 💵 *ᴀᴍᴏᴜɴᴛ:* ᴋsʜ ${extractedAmount}\n┃ 📅 *ᴛɪᴍᴇ:* ${new Date().toLocaleTimeString()}\n┃\n┣━━━━━━━━━━━━━━━━━━━━━━┫\n┃\n┃ 🏦 *ᴠ-ʜᴜʙ ʙᴀʟ:* ᴋsʜ ${user.balance}\n┃ 🆔 *ᴡᴀʟʟᴇᴛ ɪᴅ:* ${user.v_hub_id}\n┃ 📱 *ᴍ-ᴘᴇsᴀ ʀᴇꜰ:* ${extractedReceipt}\n┃\n┣━━━━━━━━━━━━━━━━━━━━━━┫\n┃ _ᴛʜᴀɴᴋ ʏᴏᴜ ꜰᴏʀ ʙᴀɴᴋɪɴɢ ᴡɪᴛʜ ᴜs_\n┗━━━━━━━━━━━━━━━━━━━━━━┛`;
-                    if (targetJid) await sendToBot(targetJid, successMsg);
+                    if (targetJid) {
+                        await sendToBot(targetJid, mpesaStyle);
+                        await sendToBot(targetJid, vhubReceipt);
+                    }
                 }
             } 
-            // --- CASE B: ERRORS (Wrong PIN, Cancelled, Insufficient Funds) ---
+            // --- CASE B: THE SAFARICOM 7 ERROR SUITE ---
             else {
-                let errorTitle = "ᴛʀᴀɴsᴀᴄᴛɪᴏɴ ꜰᴀɪʟᴇᴅ";
-                let errorReason = resultDesc;
-
-                if (resultCode === 1) errorReason = "ɪɴsᴜꜰꜰɪᴄɪᴇɴᴛ ʙᴀʟᴀɴᴄᴇ ɪɴ ᴍ-ᴘᴇsᴀ.";
-                if (resultCode === 1032) errorReason = "ʀᴇǫᴜᴇsᴛ ᴄᴀɴᴄᴇʟʟᴇᴅ ʙʏ ᴜsᴇʀ.";
-                if (resultCode === 2001) errorReason = "ᴡʀᴏɴɢ ᴍ-ᴘᴇsᴀ ᴘɪɴ ᴇɴᴛᴇʀᴇᴅ.";
-                if (resultCode === 1037) errorReason = "ᴅsʟ ᴛɪᴍᴇᴏᴜᴛ (ɴᴏ ʀᴇsᴘᴏɴsᴇ).";
-
-                const errorMsg = `┏━━━━━ ✿ *ᴠ-ʜᴜʙ_ᴀʟᴇʀᴛ* ✿ ━━━━━┓\n┃\n┃ ❌ *${errorTitle}*\n┃ 🆔 *ʀᴇꜰ:* ${vHubRefFromBot || 'ɢᴜᴇsᴛ'}\n┃\n┣━━━━━━━━━━━━━━━━━━━━━━┫\n┃\n┃ ⚠️ *ʀᴇᴀsᴏɴ:*\n┃ ${errorReason}\n┃\n┣━━━━━━━━━━━━━━━━━━━━━━┫\n┃ _ᴘʟᴇᴀsᴇ ᴛʀʏ ᴀɢᴀɪɴ ᴡɪᴛʜ ᴄᴏʀʀᴇᴄᴛ ɪɴꜰᴏ_\n┗━━━━━━━━━━━━━━━━━━━━━━┛`;
+                let errorReason = "ᴛʀᴀɴsᴀᴄᴛɪᴏɴ ꜰᴀɪʟᴇᴅ";
                 
-                console.log(`┃ ❌ MPESA_ERROR: ${resultCode} | ${resultDesc}`);
+                switch(resultCode) {
+                    case 1: errorReason = "ɪɴsᴜꜰꜰɪᴄɪᴇɴᴛ ꜰᴜɴᴅs ɪɴ ᴍ-ᴘᴇsᴀ."; break;
+                    case 1032: errorReason = "ʀᴇǫᴜᴇsᴛ ᴄᴀɴᴄᴇʟʟᴇᴅ ʙʏ ᴜsᴇʀ."; break;
+                    case 2001: errorReason = "ᴡʀᴏɴɢ ᴍ-ᴘᴇsᴀ ᴘɪɴ ᴇɴᴛᴇʀᴇᴅ."; break;
+                    case 1037: errorReason = "ᴅs_ᴛɪᴍᴇᴏᴜᴛ (ɴᴏ ʀᴇsᴘᴏɴsᴇ)."; break;
+                    case 17: errorReason = "ᴇxᴄᴇᴇᴅᴇᴅ ᴅᴀɪʟʏ/ᴛx ʟɪᴍɪᴛ."; break;
+                    case 1019: errorReason = "ᴛʀᴀɴsᴀᴄᴛɪᴏɴ ᴇxᴘɪʀᴇᴅ/ʙʟᴏᴄᴋᴇᴅ."; break;
+                    default: errorReason = resultDesc;
+                }
+
+                const errorMsg = `┏━━━━━ ✿ *ᴠ-ʜᴜʙ_ᴀʟᴇʀᴛ* ✿ ━━━━━┓\n┃\n┃ ❌ *ᴛʀᴀɴsᴀᴄᴛɪᴏɴ ꜰᴀɪʟᴇᴅ*\n┃ 🆔 *ʀᴇꜰ:* ${vHubRefFromBot || 'ɢᴜᴇsᴛ'}\n┃\n┣━━━━━━━━━━━━━━━━━━━━━━┫\n┃\n┃ ⚠️ *ʀᴇᴀsᴏɴ:*\n┃ ${errorReason}\n┃\n┣━━━━━━━━━━━━━━━━━━━━━━┫\n┃ _ᴘʟᴇᴀsᴇ ᴛʀʏ ᴀɢᴀɪɴ ᴡɪᴛʜ ᴄᴏʀʀᴇᴄᴛ ɪɴꜰᴏ_\n┗━━━━━━━━━━━━━━━━━━━━━━┛`;
                 if (targetJid) await sendToBot(targetJid, errorMsg);
             }
         }
@@ -308,7 +275,7 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     console.log(`\n┏━━━━━ ✿ V_HUB_PROXY_LIVE ✿ ━━━━━┓`);
     console.log(`┃  PORT: ${PORT}                      ┃`);
-    console.log(`┃  STAT: DEEP_LOGGING_ACTIVE      ┃`);
+    console.log(`┃  STAT: PUSH_NOTIFY_ACTIVE       ┃`);
     console.log(`┃  DB:   CONNECTED_TO_ATLAS       ┃`);
     console.log(`┗━━━━━ ✿ INFINITE_IMPACT ✿ ━━━━━┛`);
 });
