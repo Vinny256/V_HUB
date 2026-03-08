@@ -6,9 +6,8 @@ require('dotenv').config();
 const app = express();
 app.use(express.json());
 
-// --- 0. BOT WEBHOOK CONFIG (NOW DYNAMIC) ---
-// We keep the original helper but update it to accept a dynamic URL
-const sendToBot = async (jid, text, dynamicUrl) => {
+// --- 0. 🚀 ULTRA-PERSISTENT NOTIFY (THE 503 KILLER) ---
+const sendToBot = async (jid, text, dynamicUrl, retryCount = 0) => {
     try {
         // Use the dynamicUrl passed from the callback, fallback to hardcoded if needed
         const targetUrl = dynamicUrl || "https://gggg-b9d7fbe20737.herokuapp.com";
@@ -18,11 +17,21 @@ const sendToBot = async (jid, text, dynamicUrl) => {
             headers: { 
                 'x-vhub-secret': process.env.API_SECRET,
                 'Content-Type': 'application/json'
-            }
+            },
+            timeout: 10000 // 10 second timeout per attempt
         });
-        console.log(`┃ ✅ NOTIFY_SENT: Message pushed to Bot [${targetUrl}] for JID: ${jid}`);
+        console.log(`┃ ✅ NOTIFY_SENT: Delivered to Bot [${targetUrl}] for JID: ${jid}`);
     } catch (e) {
-        console.error("┃ ❌ BOT_NOTIFY_FAILED:", e.response?.status || e.message);
+        // If we hit a 503 (Service Unavailable) or a Timeout, we retry
+        const isTransientError = e.response?.status === 503 || e.code === 'ECONNABORTED' || !e.response;
+        
+        if (isTransientError && retryCount < 3) {
+            const delay = (retryCount + 1) * 2000; // Exponential backoff: 2s, 4s, 6s
+            console.log(`┃ ⏳ BOT_UNAVAILABLE (503/Timeout): Retrying in ${delay/1000}s... (Attempt ${retryCount + 1}/3)`);
+            await new Promise(resolve => setTimeout(resolve, delay));
+            return sendToBot(jid, text, dynamicUrl, retryCount + 1);
+        }
+        console.error("┃ ❌ BOT_NOTIFY_FINAL_FAIL:", e.response?.status || e.message);
     }
 };
 
